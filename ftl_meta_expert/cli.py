@@ -329,9 +329,16 @@ def import_beliefs(ctx, expert, only_in):
 
     total_imported = 0
     for exp in experts:
-        beliefs_path = os.path.join(exp["repo"], exp["beliefs_file"])
-        if not os.path.isfile(beliefs_path):
-            click.echo(f"Warning: {beliefs_path} not found, skipping {exp['name']}", err=True)
+        # Prefer network.json (lossless — preserves outlists/supersession)
+        # over beliefs.md (lossy — flattens justification structure)
+        json_path = os.path.join(exp["repo"], "network.json")
+        md_path = os.path.join(exp["repo"], exp["beliefs_file"])
+        if os.path.isfile(json_path):
+            beliefs_path = json_path
+        elif os.path.isfile(md_path):
+            beliefs_path = md_path
+        else:
+            click.echo(f"Warning: no network.json or {exp['beliefs_file']} in {exp['repo']}, skipping {exp['name']}", err=True)
             continue
 
         cmd = ["reasons", "import-agent", exp["name"], beliefs_path]
@@ -373,9 +380,10 @@ def import_beliefs(ctx, expert, only_in):
 @click.option("--auto", "auto_apply", is_flag=True, help="Automatically apply proposals")
 @click.option("--dry-run", is_flag=True, help="Print prompt without invoking LLM")
 @click.option("--budget", "-b", default=300, type=int, help="Max beliefs per agent in prompt")
+@click.option("--seed", default=None, type=int, help="Random seed for reproducible sampling")
 @click.option("--output", "-o", default="proposed-derivations.md", help="Output file for proposals")
 @click.pass_context
-def derive(ctx, auto_apply, dry_run, budget, output):
+def derive(ctx, auto_apply, dry_run, budget, seed, output):
     """Derive cross-domain insights from combined belief network."""
     config = _require_config()
 
@@ -404,7 +412,7 @@ def derive(ctx, auto_apply, dry_run, budget, output):
         sys.exit(1)
 
     # Build prompt
-    prompt = build_derive_prompt(beliefs_by_agent, derived_beliefs, budget)
+    prompt = build_derive_prompt(beliefs_by_agent, derived_beliefs, budget, seed=seed)
 
     if dry_run:
         click.echo(prompt)
