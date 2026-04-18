@@ -1,5 +1,7 @@
 """Cross-domain derivation prompt for meta expert."""
 
+import random
+
 from .common import OUTPUT_FORMAT
 
 
@@ -7,6 +9,7 @@ def build_derive_prompt(
     beliefs_by_agent: dict[str, list[dict]],
     derived_beliefs: list[dict],
     budget: int = 300,
+    seed: int | None = None,
 ) -> str:
     """Build a cross-domain derivation prompt.
 
@@ -14,7 +17,10 @@ def build_derive_prompt(
         beliefs_by_agent: Dict of agent_name -> list of belief dicts with id, text, truth_value.
         derived_beliefs: Existing cross-domain derived beliefs.
         budget: Max beliefs to include per agent.
+        seed: Random seed for sampling. None uses a random seed each run.
     """
+    rng = random.Random(seed)
+
     # Build beliefs section grouped by agent
     sections = []
     total_in = 0
@@ -23,9 +29,12 @@ def build_derive_prompt(
         in_beliefs = [b for b in beliefs if b["truth_value"] == "IN"]
         total_in += len(in_beliefs)
 
-        # Proportional budget
-        agent_budget = min(len(in_beliefs), budget)
-        selected = in_beliefs[:agent_budget]
+        # Sample if over budget, otherwise take all
+        if len(in_beliefs) > budget:
+            selected = rng.sample(in_beliefs, budget)
+            selected.sort(key=lambda b: b["id"])
+        else:
+            selected = in_beliefs
         omitted = len(in_beliefs) - len(selected)
 
         lines = [f"### {agent_name} expert ({len(in_beliefs)} IN beliefs)"]
