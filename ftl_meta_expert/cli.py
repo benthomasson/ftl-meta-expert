@@ -696,6 +696,188 @@ def summary(ctx, budget):
     )
 
 
+STEPS = ["import", "derive", "contradictions", "summary"]
+
+
+@cli.command()
+@click.option("--skip", multiple=True, type=click.Choice(STEPS),
+              help="Steps to skip (repeatable)")
+@click.option("--budget", "-b", default=300, type=int, help="Max beliefs per agent for derive/contradictions")
+@click.option("--seed", default=None, type=int, help="Random seed for derive sampling")
+@click.pass_context
+def update(ctx, skip, budget, seed):
+    """Run full update pipeline: import → derive → contradictions → summary."""
+    config = _require_config()
+    skip = set(skip)
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+    results = {}
+
+    # --- import ---
+    if "import" not in skip:
+        _emit(ctx, "═══ import ═══")
+        experts = config.get("experts", DEFAULT_EXPERTS)
+        total_imported = 0
+        for exp in experts:
+            json_path = os.path.join(exp["repo"], "network.json")
+            md_path = os.path.join(exp["repo"], exp["beliefs_file"])
+            if os.path.isfile(json_path):
+                beliefs_path = json_path
+            elif os.path.isfile(md_path):
+                beliefs_path = md_path
+            else:
+                click.echo(f"Warning: no network.json or {exp['beliefs_file']} in {exp['repo']}, skipping {exp['name']}", err=True)
+                continue
+
+            cmd = ["reasons", "import-agent", exp["name"], beliefs_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                click.echo(f"Error importing {exp['name']}: {result.stderr}", err=True)
+                continue
+            _emit(ctx, f"  Imported {exp['name']} from {beliefs_path}")
+            total_imported += 1
+
+        if total_imported > 0:
+            _reasons_export()
+        results["import"] = total_imported
+        _emit(ctx, "")
+
+    # --- derive ---
+    if "derive" not in skip:
+        _emit(ctx, "═══ derive ═══")
+        network = _load_network_json()
+        nodes = network.get("nodes", {})
+
+        beliefs_by_agent: dict[str, list[dict]] = {}
+        derived_beliefs: list[dict] = []
+        for nid, node in nodes.items():
+            if nid.endswith(":active"):
+                continue
+            belief = {"id": nid, "text": node["text"], "truth_value": node["truth_value"]}
+            if ":" in nid:
+                agent = nid.split(":")[0]
+                beliefs_by_agent.setdefault(agent, []).append(belief)
+            else:
+                derived_beliefs.append(belief)
+
+        if beliefs_by_agent:
+            prompt = build_derive_prompt(beliefs_by_agent, derived_beliefs, budget, seed=seed)
+            response = invoke_sync(prompt, model, timeout)
+            proposals = _parse_derive_proposals(response)
+            applied = 0
+            for p in proposals:
+                cmd = ["reasons", "add", p["id"], p["text"]]
+                if p["antecedents"]:
+                    cmd.extend(["--sl", ",".join(p["antecedents"])])
+                if p["outlist"]:
+                    cmd.extend(["--unless", ",".join(p["outlist"])])
+                if p["label"]:
+                    cmd.extend(["--label", p["label"]])
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    _emit(ctx, f"  [{p['kind'].upper()}] {p['id']}: {p['text'][:80]}")
+                    applied += 1
+                else:
+                    click.echo(f"  Failed: {p['id']}: {result.stderr.strip()}", err=True)
+            _reasons_export()
+            results["derive"] = applied
+            _emit(ctx, f"  Applied {applied}/{len(proposals)} derivations")
+        else:
+            _emit(ctx, "  No agent beliefs found, skipping")
+            results["derive"] = 0
+        _emit(ctx, "")
+
+    # --- contradictions ---
+    if "contradictions" not in skip:
+        _emit(ctx, "═══ contradictions ═══")
+        network = _load_network_json()
+        nodes = network.get("nodes", {})
+
+        sections = []
+        for agent_name in sorted(set(
+            nid.split(":")[0] for nid in nodes if ":" in nid and not nid.endswith(":active")
+        )):
+            agent_beliefs = [
+                (nid, node) for nid, node in nodes.items()
+                if nid.startswith(f"{agent_name}:") and not nid.endswith(":active")
+                and node["truth_value"] == "IN"
+            ]
+            if not agent_beliefs:
+                continue
+            lines = [f"### {agent_name} expert ({len(agent_beliefs)} IN beliefs)"]
+            for nid, node in agent_beliefs[:budget]:
+                lines.append(f"- `{nid}`: {node['text'][:200]}")
+            if len(agent_beliefs) > budget:
+                lines.append(f"*({len(agent_beliefs) - budget} more omitted)*")
+            sections.append("\n".join(lines))
+
+        if sections:
+            beliefs_section = "\n\n".join(sections)
+            prompt = CONTRADICTION_DETECTION_PROMPT.format(beliefs_section=beliefs_section)
+            response = invoke_sync(prompt, model, timeout)
+            proposals = _parse_nogood_proposals(response)
+            applied = 0
+            for p in proposals:
+                cmd = ["reasons", "nogood"] + p["claims"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    _emit(ctx, f"  [NOGOOD] {p['id']}: {', '.join(p['claims'])}")
+                    applied += 1
+                else:
+                    click.echo(f"  Failed: {p['id']}: {result.stderr.strip()}", err=True)
+            _reasons_export()
+            results["contradictions"] = applied
+            _emit(ctx, f"  Applied {applied}/{len(proposals)} nogoods")
+        else:
+            _emit(ctx, "  No agent beliefs found, skipping")
+            results["contradictions"] = 0
+        _emit(ctx, "")
+
+    # --- summary ---
+    if "summary" not in skip:
+        _emit(ctx, "═══ summary ═══")
+        domain = config.get("domain", "")
+        beliefs_text = _get_compact(2000)
+        network = _load_network_json()
+        nodes = network.get("nodes", {})
+        nogoods = network.get("nogoods", [])
+
+        agent_stats: dict[str, int] = {"nogoods": len(nogoods), "derived": 0}
+        for nid, node in nodes.items():
+            if nid.endswith(":active"):
+                continue
+            if ":" in nid:
+                agent = nid.split(":")[0]
+                agent_stats[agent] = agent_stats.get(agent, 0) + 1
+            else:
+                agent_stats["derived"] += 1
+
+        prompt = build_summary_prompt(beliefs_text, domain, agent_stats)
+        response = invoke_sync(prompt, model, timeout)
+        click.echo(response)
+
+        _create_entry(
+            "update",
+            "Full pipeline update",
+            f"## Pipeline Results\n"
+            f"- Import: {results.get('import', 'skipped')}\n"
+            f"- Derive: {results.get('derive', 'skipped')}\n"
+            f"- Contradictions: {results.get('contradictions', 'skipped')}\n\n"
+            f"## Summary\n{response}",
+        )
+
+    # --- final status ---
+    _emit(ctx, "")
+    _emit(ctx, "═══ done ═══")
+    for step in STEPS:
+        if step in skip:
+            _emit(ctx, f"  {step:16s} skipped")
+        elif step in results:
+            _emit(ctx, f"  {step:16s} {results[step]}")
+        else:
+            _emit(ctx, f"  {step:16s} done")
+
+
 @cli.command()
 @click.option("--all", "show_all", is_flag=True, help="Show all topics including done/skipped")
 @click.pass_context
