@@ -341,7 +341,7 @@ def import_beliefs(ctx, expert, only_in):
             click.echo(f"Warning: no network.json or {exp['beliefs_file']} in {exp['repo']}, skipping {exp['name']}", err=True)
             continue
 
-        cmd = ["reasons", "import-agent", exp["name"], beliefs_path]
+        cmd = ["reasons", "sync-agent", exp["name"], beliefs_path]
         if only_in:
             cmd.append("--only-in")
 
@@ -729,7 +729,7 @@ def update(ctx, skip, budget, seed):
                 click.echo(f"Warning: no network.json or {exp['beliefs_file']} in {exp['repo']}, skipping {exp['name']}", err=True)
                 continue
 
-            cmd = ["reasons", "import-agent", exp["name"], beliefs_path]
+            cmd = ["reasons", "sync-agent", exp["name"], beliefs_path]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 click.echo(f"Error importing {exp['name']}: {result.stderr}", err=True)
